@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture(1)
 #cap-camera capture object hai(variable name),cv2.VideoCapture()-video stream open karta hai
 #matlb ki camera on hogya
 #loop statement use kiya hai tabh tak true reega jab tak break nhi hota
