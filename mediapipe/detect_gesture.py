@@ -4,6 +4,8 @@ import numpy as np
 import joblib
 import time
 import math
+import winsound
+import threading
 
 # ── Model & MediaPipe ─────────────────────────────────────────────────────────
 model   = joblib.load("gesture_model.pkl")
@@ -27,11 +29,36 @@ GESTURE_TO_COMMAND = {
     "thumbs_up":   "STAND",
 }
 
+# (frequency_hz, duration_ms) — distinct tones so you know which command fired
+COMMAND_BEEP = {
+    "STAY":     (400,  200),   # low short — stop
+    "FORWARD":  (900,  150),   # high short — go
+    "WALK":     (900,  300),   # high long  — go (slower)
+    "BACKWARD": (600,  200),   # mid short  — reverse
+    "SIT_DOWN": (500,  400),   # low long   — sit
+    "STAND":    (1100, 200),   # highest    — stand up
+}
+
 # ── Tuning ────────────────────────────────────────────────────────────────────
 LM_ALPHA       = 0.50   # landmark EMA  (0 = frozen, 1 = no smoothing)
 PROB_ALPHA     = 0.10   # probability EMA
 CONFIRM_THRESH = 0.50   # min smoothed prob to accept a gesture
 HOLD_TIME      = 5.0    # seconds to hold gesture before command fires
+COOLDOWN_TIME  = 2.0    # seconds before same command can fire again
+MACRO_HOLD_TIME = 10.0  # hold this long to trigger macro instead of single command
+
+# Gesture macro sequences — (command, duration_seconds)
+MACRO_SEQUENCES = {
+    "ok": [
+        ("SIT_DOWN",  2.0),   # sit down
+        ("STAND",     2.0),   # stand up
+        ("WALK",      2.0),   # start walking
+        ("FORWARD",   2.5),   # move forward
+        ("BACKWARD",  2.5),   # move backward
+        ("STAY",      1.5),   # stop and hold position
+        ("SIT_DOWN",  2.0),   # final sit down
+    ],
+}
 
 DEBUG = True            # show per-finger state overlay; set False to hide
 
@@ -40,6 +67,12 @@ smoothed_lm        = None
 smoothed_probs     = None
 stable_gesture     = None
 gesture_start_time = None
+last_hand_time     = None
+no_hand_stop_sent  = False
+prev_frame_time    = time.time()
+last_command_time  = {}   # command → timestamp of last fire
+macro_cancel       = threading.Event()
+macro_status       = ""   # shown on HUD while macro runs
 
 
 # =============================================================================
@@ -307,8 +340,8 @@ def geometry_override(ml_pred, lm):
     if all_open:
         return 'open_palm'
 
-    # ── 9. Fallback: trust ML model for any combination rules don't cover ─────
-    return ml_pred
+    # ── 9. Fallback: trust ML model only for gestures in the command map ─────
+    return ml_pred if ml_pred in GESTURE_TO_COMMAND else 'Unknown'
 
 
 # =============================================================================
@@ -316,14 +349,22 @@ def geometry_override(ml_pred, lm):
 # =============================================================================
 
 def select_closest_hand(multi_landmarks, w, h):
-    """Return the hand landmark set with the largest bounding box (closest to cam)."""
-    best, best_area = None, 0
+    """Return the hand closest to the camera.
+
+    Uses average wrist-to-MCP distance instead of bounding box area.
+    Bounding box fails when a close hand is partially off-screen — MediaPipe
+    clamps landmark coords to [0,1], shrinking the box and making the far
+    hand appear larger. Wrist + MCP joints stay on-screen even when fingers
+    go out of frame, so this metric is reliable at any distance.
+    """
+    best, best_size = None, 0.0
     for lm_set in multi_landmarks:
-        xs = [lm.x * w for lm in lm_set.landmark]
-        ys = [lm.y * h for lm in lm_set.landmark]
-        area = (max(xs) - min(xs)) * (max(ys) - min(ys))
-        if area > best_area:
-            best_area = area
+        lm = lm_set.landmark
+        wrist = np.array([lm[0].x * w, lm[0].y * h])
+        mcps  = [np.array([lm[i].x * w, lm[i].y * h]) for i in [5, 9, 13, 17]]
+        size  = float(np.mean([np.linalg.norm(wrist - m) for m in mcps]))
+        if size > best_size:
+            best_size = size
             best      = lm_set
     return best
 
@@ -372,6 +413,36 @@ def draw_debug_overlay(frame, lm, w):
 
 
 # =============================================================================
+# MACRO RUNNER
+# =============================================================================
+
+def run_macro(gesture_name):
+    global macro_status
+    sequence = MACRO_SEQUENCES[gesture_name]
+    total    = len(sequence)
+    for i, (cmd, duration) in enumerate(sequence):
+        if macro_cancel.is_set():
+            macro_status = "Macro cancelled"
+            time.sleep(0.8)
+            macro_status = ""
+            return
+        macro_status = f"MACRO {i+1}/{total}: {cmd}"
+        print(f"[MACRO] Step {i+1}/{total} → {cmd}")
+        freq, dur = COMMAND_BEEP.get(cmd, (800, 200))
+        winsound.Beep(freq, dur)
+        elapsed = 0.0
+        while elapsed < duration:
+            if macro_cancel.is_set():
+                break
+            time.sleep(0.1)
+            elapsed += 0.1
+    if not macro_cancel.is_set():
+        print("[MACRO] Routine complete")
+        winsound.Beep(1200, 300)
+    macro_status = ""
+
+
+# =============================================================================
 # MAIN LOOP
 # =============================================================================
 
@@ -394,6 +465,8 @@ while True:
     smooth_conf = 0.0
 
     if result.multi_hand_landmarks:
+        last_hand_time    = time.time()
+        no_hand_stop_sent = False
 
         # ── Step 1: Pick closest hand ─────────────────────────────────────────
         hand_lm = select_closest_hand(result.multi_hand_landmarks, w, h)
@@ -483,13 +556,39 @@ while True:
         # ── Hold timer ────────────────────────────────────────────────────────
         if gesture in GESTURE_TO_COMMAND:
             if gesture != stable_gesture:
+                # Cancel macro if gesture changed
+                if macro_status:
+                    macro_cancel.set()
                 stable_gesture     = gesture
                 gesture_start_time = time.time()
                 print(f"Gesture: {gesture}  →  Command: {GESTURE_TO_COMMAND[gesture]}")
-            elif gesture_start_time and time.time() - gesture_start_time >= HOLD_TIME:
-                print(f"Robot Command CONFIRMED: {GESTURE_TO_COMMAND[gesture]}")
-                gesture_start_time = time.time()
+            elif gesture_start_time:
+                elapsed = time.time() - gesture_start_time
+                # Macro threshold (long hold) — checked before regular command
+                if gesture in MACRO_SEQUENCES and elapsed >= MACRO_HOLD_TIME:
+                    if not macro_status:
+                        print(f"[MACRO] Triggered by {gesture}")
+                        macro_cancel.clear()
+                        threading.Thread(target=run_macro, args=(gesture,), daemon=True).start()
+                    gesture_start_time = time.time()
+                elif elapsed >= HOLD_TIME:
+                    cmd    = GESTURE_TO_COMMAND[gesture]
+                    now    = time.time()
+                    last_t = last_command_time.get(cmd, 0)
+                    # Macro gestures: only fire once (block re-fire until macro zone)
+                    effective_cooldown = (MACRO_HOLD_TIME - HOLD_TIME) if gesture in MACRO_SEQUENCES else COOLDOWN_TIME
+                    if now - last_t >= effective_cooldown:
+                        print(f"Robot Command CONFIRMED: {cmd}")
+                        freq, dur = COMMAND_BEEP.get(cmd, (800, 200))
+                        winsound.Beep(freq, dur)
+                        last_command_time[cmd] = now
+                    # Macro gestures keep counting toward MACRO_HOLD_TIME
+                    if gesture not in MACRO_SEQUENCES:
+                        gesture_start_time = time.time()
         else:
+            # Fist while macro running = cancel
+            if gesture == "Fist" and macro_status:
+                macro_cancel.set()
             stable_gesture     = None
             gesture_start_time = None
 
@@ -498,17 +597,36 @@ while True:
         smoothed_probs     = None
         stable_gesture     = None
         gesture_start_time = None
+        if last_hand_time and not no_hand_stop_sent:
+            if time.time() - last_hand_time >= 1.0 and not macro_status:
+                print("Robot Command: STOP  (no hand detected)")
+                no_hand_stop_sent = True
 
     # ── Hold countdown bar ────────────────────────────────────────────────────
     hold_text = ""
     if stable_gesture and gesture_start_time:
-        elapsed   = time.time() - gesture_start_time
-        remaining = max(0.0, HOLD_TIME - elapsed)
-        hold_text = f"Hold: {remaining:.1f}s"
-        progress  = min(elapsed / HOLD_TIME, 1.0)
-        cv2.rectangle(frame, (10, 130), (10 + int(300 * progress), 148),
-                      (0, 255, 100), -1)
+        elapsed       = time.time() - gesture_start_time
+        is_macro_gest = stable_gesture in MACRO_SEQUENCES
+        if is_macro_gest and elapsed >= HOLD_TIME:
+            # Purple zone — approaching macro threshold
+            remaining = max(0.0, MACRO_HOLD_TIME - elapsed)
+            hold_text = f"MACRO in {remaining:.1f}s — keep holding!"
+            progress  = min((elapsed - HOLD_TIME) / (MACRO_HOLD_TIME - HOLD_TIME), 1.0)
+            cv2.rectangle(frame, (10, 130), (310, 148), (40, 40, 40), -1)
+            cv2.rectangle(frame, (10, 130), (10 + int(300 * progress), 148),
+                          (180, 0, 180), -1)
+        else:
+            remaining = max(0.0, HOLD_TIME - elapsed)
+            hold_text = f"Hold: {remaining:.1f}s"
+            progress  = min(elapsed / HOLD_TIME, 1.0)
+            cv2.rectangle(frame, (10, 130), (10 + int(300 * progress), 148),
+                          (0, 255, 100), -1)
         cv2.rectangle(frame, (10, 130), (310, 148), (100, 100, 100), 1)
+
+    # ── FPS ───────────────────────────────────────────────────────────────────
+    now             = time.time()
+    fps             = 1.0 / max(now - prev_frame_time, 1e-9)
+    prev_frame_time = now
 
     # ── HUD ───────────────────────────────────────────────────────────────────
     cv2.putText(frame, f"Gesture: {gesture}",
@@ -517,6 +635,11 @@ while True:
                 (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
     cv2.putText(frame, f"Raw:{raw_conf*100:.0f}%  Smooth:{smooth_conf*100:.0f}%",
                 (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 1)
+    cv2.putText(frame, f"FPS:{fps:.0f}",
+                (w - 90, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1)
+    if macro_status:
+        cv2.putText(frame, macro_status,
+                    (10, h - 55), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 0, 180), 2)
 
     cv2.imshow("Robot Gesture Control", frame)
     if cv2.waitKey(1) & 0xFF == 27:
