@@ -3,5 +3,3 @@ __pycache__/
 *.pyc
 structure.txt
 .vscode/
-mediapipe/data.csv
-mediapipe/gesture_model.pkl
