@@ -3,256 +3,192 @@ import mediapipe as mp
 import numpy as np
 import joblib
 import time
-from collections import deque
 
-# ==========================
-# Load Model
-# ==========================
-model = joblib.load("gesture_model.pkl")
+model   = joblib.load("gesture_model.pkl")
+CLASSES = model.classes_
 
-# ==========================
-# MediaPipe Setup
-# ==========================
 mp_hands = mp.solutions.hands
-mp_draw = mp.solutions.drawing_utils
-
-hands = mp_hands.Hands(
-    max_num_hands=2,
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.7
+mp_draw  = mp.solutions.drawing_utils
+hands    = mp_hands.Hands(
+    max_num_hands            = 2,     # detect up to 2, but only use closest
+    min_detection_confidence = 0.7,
+    min_tracking_confidence  = 0.7,
 )
+cap = cv2.VideoCapture(1)
 
-# ==========================
-# Webcam
-# ==========================
-cap = cv2.VideoCapture(1)   # Change to 0 if needed
-
-# ==========================
-# Smoothing
-# ==========================
-history = deque(maxlen=10)
-
-# ==========================
-# Gesture Mapping
-# ==========================
-gesture_to_command = {
-    "Fist": "STAY",
-    "open_palm": "STOP",
-    "ok": "WALK",
-    "peace": "BACKWARD",
+GESTURE_TO_COMMAND = {
+    "Fist":        "STAY",
+    "open_palm":   "STOP",
+    "ok":          "WALK",
+    "peace":       "BACKWARD",
     "thumbs_down": "SIT_DOWN",
-    "thumbs_up": "STAND",
-    "namasate": "NAMASTE",
-    "one_finger": "FORWARD"
+    "thumbs_up":   "STAND",
+    "one_finger":  "FORWARD",
 }
 
-# ==========================
-# Variables
-# ==========================
-stable_gesture = None
+# ── Tuning ───────────────────────────────────────────────────────────────────
+LM_ALPHA      = 0.50   # landmark EMA  — high = responsive, low = smoother source
+PROB_ALPHA    = 0.10   # probability EMA — low = very stable output
+CONFIRM_THRESH = 0.50  # min smoothed probability to accept a gesture
+HOLD_TIME      = 5.0   # seconds to hold gesture before command fires
+# ─────────────────────────────────────────────────────────────────────────────
+
+smoothed_lm    = None   # shape (21, 3) — EMA over landmark x,y,z
+smoothed_probs = None   # shape (n_classes,) — EMA over model probabilities
+stable_gesture     = None
 gesture_start_time = None
 
-HOLD_TIME = 2.0
-CONFIDENCE_THRESH = 0.9
 
-gesture = "No Hand"
-confidence = 0.0
+def select_closest_hand(multi_landmarks, w, h):
+    """Return the hand landmark with the largest bounding box (closest to camera)."""
+    best, best_area = None, 0
+    for lm_set in multi_landmarks:
+        xs = [lm.x * w for lm in lm_set.landmark]
+        ys = [lm.y * h for lm in lm_set.landmark]
+        area = (max(xs) - min(xs)) * (max(ys) - min(ys))
+        if area > best_area:
+            best_area = area
+            best      = lm_set
+    return best
 
-# ==========================
-# Main Loop
-# ==========================
+
+def fix_prediction(pred, lm):
+    """Geometry override: open_palm vs peace — check if ring+pinky are extended."""
+    if pred in ("open_palm", "peace"):
+        wrist     = np.array([lm[0].x,  lm[0].y])
+        ring_tip  = np.array([lm[16].x, lm[16].y])
+        ring_pip  = np.array([lm[14].x, lm[14].y])
+        pinky_tip = np.array([lm[20].x, lm[20].y])
+        pinky_pip = np.array([lm[18].x, lm[18].y])
+        ring_ext  = np.linalg.norm(ring_tip  - wrist) > np.linalg.norm(ring_pip  - wrist)
+        pinky_ext = np.linalg.norm(pinky_tip - wrist) > np.linalg.norm(pinky_pip - wrist)
+        return "open_palm" if (ring_ext and pinky_ext) else "peace"
+    return pred
+
+
 while True:
-
     ret, frame = cap.read()
-
     if not ret:
-        print("Failed to read camera")
         break
 
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result = hands.process(rgb)
-
-    gesture = "No Hand"
-    confidence = 0.0
-
     h, w, _ = frame.shape
+    rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    result  = hands.process(rgb)
+
+    gesture     = "No Hand"
+    raw_conf    = 0.0
+    smooth_conf = 0.0
 
     if result.multi_hand_landmarks:
 
-        # Find nearest hand (largest bounding box)
-        largest_area = 0
-        selected_hand = None
+        # ── Step 1: Pick closest hand ─────────────────────────────────────
+        hand_lm = select_closest_hand(result.multi_hand_landmarks, w, h)
+        mp_draw.draw_landmarks(frame, hand_lm, mp_hands.HAND_CONNECTIONS)
 
-        for hand_landmarks in result.multi_hand_landmarks:
+        lm = hand_lm.landmark
 
-            x_list = []
-            y_list = []
+        # ── Step 2: Landmark EMA (source smoothing) ───────────────────────
+        raw_lm = np.array([[p.x, p.y, p.z] for p in lm], dtype=float)  # (21, 3)
 
-            for lm in hand_landmarks.landmark:
-                x_list.append(int(lm.x * w))
-                y_list.append(int(lm.y * h))
+        if smoothed_lm is None:
+            smoothed_lm = raw_lm.copy()
+        else:
+            smoothed_lm = LM_ALPHA * raw_lm + (1 - LM_ALPHA) * smoothed_lm
 
-            x_min = min(x_list)
-            x_max = max(x_list)
-            y_min = min(y_list)
-            y_max = max(y_list)
+        # Build feature row from smoothed landmarks
+        base_x = smoothed_lm[0, 0]
+        base_y = smoothed_lm[0, 1]
+        row = []
+        for x, y, z in smoothed_lm:
+            row.append(x - base_x)
+            row.append(y - base_y)
+            row.append(z)
 
-            area = (x_max - x_min) * (y_max - y_min)
+        # ── Step 3: Model prediction ──────────────────────────────────────
+        raw_probs = model.predict_proba([row])[0]
+        raw_conf  = float(np.max(raw_probs))
 
-            if area > largest_area:
-                largest_area = area
-                selected_hand = hand_landmarks
+        # ── Step 4: Probability EMA (output smoothing) ────────────────────
+        if smoothed_probs is None:
+            smoothed_probs = raw_probs.copy()
+        else:
+            smoothed_probs = PROB_ALPHA * raw_probs + (1 - PROB_ALPHA) * smoothed_probs
 
-        # Use only nearest hand
-        if selected_hand is not None:
-            hand_landmarks = selected_hand
+        smooth_conf = float(np.max(smoothed_probs))
+        pred        = CLASSES[int(np.argmax(smoothed_probs))]
+        pred        = fix_prediction(pred, lm)
 
-            mp_draw.draw_landmarks(
-                frame,
-                hand_landmarks,
-                mp_hands.HAND_CONNECTIONS
-            )
+        gesture = pred if smooth_conf >= CONFIRM_THRESH else "Low conf"
 
-            x_list = []
-            y_list = []
+        # ── Bounding box + label ──────────────────────────────────────────
+        xs  = [int(p.x * w) for p in lm]
+        ys  = [int(p.y * h) for p in lm]
+        pad = 20
+        cv2.rectangle(frame,
+                      (min(xs)-pad, min(ys)-pad),
+                      (max(xs)+pad, max(ys)+pad),
+                      (0, 255, 0), 2)
+        cv2.putText(frame, gesture,
+                    (min(xs)-pad, min(ys)-pad-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-            for lm in hand_landmarks.landmark:
-                x_list.append(int(lm.x * w))
-                y_list.append(int(lm.y * h))
+        # Show other hands as inactive (grey box)
+        for other_lm in result.multi_hand_landmarks:
+            if other_lm is hand_lm:
+                continue
+            oxs = [int(p.x * w) for p in other_lm.landmark]
+            oys = [int(p.y * h) for p in other_lm.landmark]
+            cv2.rectangle(frame,
+                          (min(oxs)-pad, min(oys)-pad),
+                          (max(oxs)+pad, max(oys)+pad),
+                          (100, 100, 100), 1)
+            cv2.putText(frame, "ignored",
+                        (min(oxs)-pad, min(oys)-pad-8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
 
-            x_min = min(x_list)
-            x_max = max(x_list)
-            y_min = min(y_list)
-            y_max = max(y_list)
+        # ── Hold timer ────────────────────────────────────────────────────
+        if gesture in GESTURE_TO_COMMAND:
+            if gesture != stable_gesture:
+                stable_gesture     = gesture
+                gesture_start_time = time.time()
+            elif gesture_start_time and time.time() - gesture_start_time >= HOLD_TIME:
+                print("Robot Command:", GESTURE_TO_COMMAND[gesture])
+                gesture_start_time = time.time()
+        else:
+            stable_gesture     = None
+            gesture_start_time = None
 
-            padding = 20
+    else:
+        # Hand left frame — reset all smoothing state
+        smoothed_lm        = None
+        smoothed_probs     = None
+        stable_gesture     = None
+        gesture_start_time = None
 
-            cv2.rectangle(
-                frame,
-                (x_min - padding, y_min - padding),
-                (x_max + padding, y_max + padding),
-                (0, 255, 0),
-                2
-            )
-
-            base_x = hand_landmarks.landmark[0].x
-            base_y = hand_landmarks.landmark[0].y
-
-            row = []
-
-            for lm in hand_landmarks.landmark:
-                row.append(lm.x - base_x)
-                row.append(lm.y - base_y)
-                row.append(lm.z)
-
-            probs = model.predict_proba([row])[0]
-            confidence = np.max(probs)
-
-            if confidence > CONFIDENCE_THRESH:
-
-                pred = model.predict([row])[0]
-
-                history.append(pred)
-
-                gesture = max(set(history), key=history.count)
-
-            else:
-                gesture = "Unknown"
-
-            cv2.putText(
-                frame,
-                gesture,
-                (x_min - padding, y_min - padding - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
-                2
-            )
-
-            cv2.putText(
-                frame,
-                f"{confidence*100:.1f}%",
-                (x_min - padding, y_max + 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 0),
-                2
-            )
-
-            if gesture in gesture_to_command:
-
-                if gesture != stable_gesture:
-                    stable_gesture = gesture
-                    gesture_start_time = time.time()
-
-                elif (
-                    gesture_start_time is not None
-                    and time.time() - gesture_start_time >= HOLD_TIME
-                ):
-
-                    command = gesture_to_command[gesture]
-
-                    print("Robot Command:", command)
-
-                    gesture_start_time = time.time()
-
-            else:
-                stable_gesture = None
-                gesture_start_time = None
-
-    # ==========================
-    # Hold Countdown
-    # ==========================
+    # ── Hold countdown bar ────────────────────────────────────────────────
     hold_text = ""
-
     if stable_gesture and gesture_start_time:
-
-        elapsed = time.time() - gesture_start_time
-        remaining = max(0, HOLD_TIME - elapsed)
-
+        elapsed   = time.time() - gesture_start_time
+        remaining = max(0.0, HOLD_TIME - elapsed)
         hold_text = f"Hold: {remaining:.1f}s"
 
-    # ==========================
-    # Global Display
-    # ==========================
-    cv2.putText(
-        frame,
-        f"Gesture: {gesture}",
-        (10, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1,
-        (0, 255, 0),
-        2
-    )
+        # Progress bar for hold
+        progress = min(elapsed / HOLD_TIME, 1.0)
+        cv2.rectangle(frame, (10, 130), (10 + int(300 * progress), 148),
+                      (0, 255, 100), -1)
+        cv2.rectangle(frame, (10, 130), (310, 148), (100, 100, 100), 1)
 
-    cv2.putText(
-        frame,
-        hold_text,
-        (10, 80),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1,
-        (0, 0, 255),
-        2
-    )
+    # ── HUD ───────────────────────────────────────────────────────────────
+    cv2.putText(frame, f"Gesture: {gesture}",
+                (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+    cv2.putText(frame, hold_text,
+                (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+    cv2.putText(frame, f"Raw:{raw_conf*100:.0f}%  Smooth:{smooth_conf*100:.0f}%",
+                (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 1)
 
-    cv2.putText(
-        frame,
-        f"Confidence: {confidence*100:.1f}%",
-        (10, 120),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (255, 255, 0),
-        2
-    )
-
-    cv2.imshow("AI Gesture Control", frame)
-
-    # ESC key
+    cv2.imshow("Robot Gesture Control", frame)
     if cv2.waitKey(1) & 0xFF == 27:
         break
 
-# ==========================
-# Cleanup
-# ==========================
 cap.release()
 cv2.destroyAllWindows()

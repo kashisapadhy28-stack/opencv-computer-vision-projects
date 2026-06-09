@@ -38,7 +38,7 @@ class Config:
     """All tuneable parameters in one place. Edit these to adjust behaviour."""
 
     # ── Webcam ─────────────────────────────────────────────────────────────
-    WEBCAM_INDEX        = 0          # 0 = default camera
+    WEBCAM_INDEX        = 1          # 0 = default camera
     FRAME_WIDTH         = 1280
     FRAME_HEIGHT        = 720
 
@@ -74,7 +74,7 @@ class Config:
     # ── HUD ────────────────────────────────────────────────────────────────
     FONT                = cv2.FONT_HERSHEY_SIMPLEX
     PANEL_ALPHA         = 0.60
-    WINDOW_TITLE        = "CANIS — Gesture Control v3"
+    WINDOW_TITLE        = "Robot Dog — Gesture Control"
 
 
 # =============================================================================
@@ -93,29 +93,29 @@ G_SPREAD       = "SPREAD_FINGERS"
 G_EXCITED      = "PALM_SHAKE"
 G_UNKNOWN      = "UNKNOWN"
 
-S_STOP         = "CANIS_STOP"
-S_WALK         = "CANIS_WALK"
-S_SIT          = "CANIS_SIT"
-S_STAY         = "CANIS_STAY"
-S_STAND        = "CANIS_STAND"
-S_TURN_RIGHT   = "CANIS_TURN_RIGHT"
-S_TURN_LEFT    = "CANIS_TURN_LEFT"
-S_MOVE_MODE    = "CANIS_MOVE_MODE"
-S_ATTENTION    = "CANIS_ATTENTION"
-S_EXCITED      = "CANIS_EXCITED"
-S_NONE         = "CANIS_NONE"
+S_STOP         = "STOP"
+S_WALK         = "WALK"
+S_SIT          = "SIT_DOWN"
+S_STAY         = "STAY"
+S_STAND        = "STAND"
+S_TURN_RIGHT   = "TURN_RIGHT"
+S_TURN_LEFT    = "TURN_LEFT"
+S_FORWARD      = "FORWARD"
+S_BACKWARD     = "BACKWARD"
+S_NAMASTE      = "NAMASTE"
+S_NONE         = "NONE"
 
 GESTURE_TO_STATE = {
-    G_OPEN_PALM:   S_STOP,
-    G_THUMBS_UP:   S_WALK,
-    G_THUMBS_DOWN: S_SIT,
-    G_FIST:        S_STAY,
-    G_ONE_FINGER:  S_STAND,
-    G_POINT_RIGHT: S_TURN_RIGHT,
-    G_POINT_LEFT:  S_TURN_LEFT,
-    G_TWO_FINGERS: S_MOVE_MODE,
-    G_SPREAD:      S_ATTENTION,
-    G_EXCITED:     S_EXCITED,
+    G_OPEN_PALM:   S_STOP,       # open palm flat   → STOP
+    G_FIST:        S_STAY,       # tight fist        → STAY
+    G_THUMBS_UP:   S_STAND,      # thumb up          → STAND
+    G_THUMBS_DOWN: S_SIT,        # thumb down        → SIT_DOWN
+    G_ONE_FINGER:  S_FORWARD,    # index finger up   → FORWARD
+    G_TWO_FINGERS: S_BACKWARD,   # peace sign        → BACKWARD
+    G_POINT_RIGHT: S_TURN_RIGHT, # index pointing →  → TURN_RIGHT
+    G_POINT_LEFT:  S_TURN_LEFT,  # index pointing ←  → TURN_LEFT
+    G_SPREAD:      S_WALK,       # fingers spread    → WALK
+    G_EXCITED:     S_NAMASTE,    # palm shake        → NAMASTE
 }
 
 GESTURE_COLOR = {
@@ -630,8 +630,8 @@ class CanisStateMachine:
 # =============================================================================
 
 def send_serial_command(state: str, port: str = None, baudrate: int = 115200):
-    ts = time.strftime("%H:%M:%S")
-    print(f"    [{ts}] [SERIAL MOCK] → {state}")
+    print(f"Robot Command: {state}")
+    # Uncomment below to send over serial to your robot:
     # import serial
     # with serial.Serial(port, baudrate, timeout=1) as ser:
     #     ser.write((state + '\n').encode('utf-8'))
